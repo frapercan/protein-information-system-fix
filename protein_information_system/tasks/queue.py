@@ -1,6 +1,36 @@
 """
 Queue Tasks
 =============
+
+Queue tasks distribute work through RabbitMQ: ``enqueue()`` publishes tasks to a
+computing queue, worker processes run ``process()`` and publish the results to an
+inserting queue, and a database worker runs ``store_entry()``. When the queues are
+drained, ``post_processing()`` runs once.
+
+**Error handling**
+
+- ``process()`` raising ``ValueError`` means "skip this task": the message is
+  acknowledged and the number of skipped tasks is reported at the end.
+- Any other error in ``process()``: the task is retried once after
+  ``task_retry_delay`` seconds (default 5). If it fails again it is discarded. A
+  message that was already redelivered (for example after a worker crash) is
+  discarded on its first failure.
+- An error in ``store_entry()``: the record is discarded.
+- Discarded tasks and worker processes that exit abnormally are counted. At the end
+  of ``start()`` they are logged; with ``fail_on_task_errors: True`` a
+  :class:`TaskFailuresError` is raised instead. Post-processing always runs first,
+  so partial results are written.
+- Errors while starting or joining workers, and errors in ``post_processing()``,
+  are raised by ``start()``. A post-processing error never hides an earlier
+  pipeline error.
+
+**Queues**
+
+Each task uses ``<task>_computing``, ``<task>_inserting`` and, for GPU tasks,
+``<task>_computing_<model>``, where ``<task>`` is the lower-cased class name. With
+``delete_queues: True`` these queues, and only these, are deleted at start-up.
+Two runs of the same task on one broker share these queues and should not run
+concurrently.
 """
 
 import multiprocessing

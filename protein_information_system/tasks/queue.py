@@ -117,8 +117,14 @@ class QueueTaskInitializer(BaseTaskInitializer):
         - Enqueue tasks
         - Launch workers and wait for completion
         - Run post-processing hook
+
+        Raises:
+            Exception: Any error from the pipeline. An error from the post-processing
+                hook is raised when the pipeline itself succeeded; if the pipeline
+                failed, it is logged and the pipeline error is raised instead.
         """
         self.logger.info("Starting the task processing pipeline.")
+        completed = False
         try:
             self.setup_rabbitmq()
             self.logger.info("RabbitMQ set up. Enqueueing tasks…")
@@ -126,6 +132,7 @@ class QueueTaskInitializer(BaseTaskInitializer):
             self.logger.info("Tasks enqueued. Starting workers…")
             self.start_workers()
             self.logger.info("All workers finished. Running post-processing hook…")
+            completed = True
         except Exception as e:
             self.logger.error("Error in task processing pipeline: %s", e, exc_info=True)
             raise
@@ -137,6 +144,10 @@ class QueueTaskInitializer(BaseTaskInitializer):
                 self.logger.info("Post-processing hook completed.")
             except Exception as e:
                 self.logger.error("Post-processing hook failed: %s", e, exc_info=True)
+                # Only surface it when the pipeline itself succeeded; otherwise the
+                # original pipeline error is already propagating.
+                if completed:
+                    raise
 
     def start_workers(self):
         """
@@ -174,6 +185,7 @@ class QueueTaskInitializer(BaseTaskInitializer):
                 f"Error during worker execution: {e}",
                 exc_info=True
             )
+            raise
         finally:
             self.stop_event.set()
             for t in self.threads:

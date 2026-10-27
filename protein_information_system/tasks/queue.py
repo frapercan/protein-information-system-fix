@@ -347,11 +347,27 @@ class QueueTaskInitializer(BaseTaskInitializer):
             )
             ch.basic_ack(delivery_tag=method.delivery_tag)
         except Exception as e:
-            self.logger.error(
-                f"Error while processing message in the computing queue: {e}",
-                exc_info=True
-            )
-            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+            # Retry once, after task_retry_delay seconds so that a brief outage of a
+            # remote service can recover. A message that fails again is discarded:
+            # requeueing it forever loops on permanent errors (with basic_get it is
+            # fetched again immediately). A message redelivered after a consumer crash
+            # also counts as a retry.
+            if getattr(method, "redelivered", False):
+                self.logger.error(
+                    f"Error while processing message in the computing queue after a retry: {e}. "
+                    "Discarding the message.",
+                    exc_info=True
+                )
+                ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+            else:
+                delay = float(self.conf.get('task_retry_delay', 5))
+                self.logger.error(
+                    f"Error while processing message in the computing queue: {e}. "
+                    f"Retrying once in {delay:g} s.",
+                    exc_info=True
+                )
+                time.sleep(delay)
+                ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
 
     @abstractmethod
     def enqueue(self):

@@ -69,7 +69,7 @@ class QueueTaskInitializer(BaseTaskInitializer):
         )
         self.logger.info("QueueTaskInitializer has been successfully initialized.")
         if self.conf.get('delete_queues', False):
-            self.delete_all_queues()
+            self.delete_task_queues()
 
         self.connection = self.create_rabbitmq_connection()
         self.channel = self.connection.channel()
@@ -331,11 +331,7 @@ class QueueTaskInitializer(BaseTaskInitializer):
                     self.logger.warning("No queues found from RabbitMQ API.")
                     continue
 
-                # Filtrar colas relevantes por patrones
-                relevant_queues = [
-                    queue for queue in all_queues
-                    if self.computing_queue in queue['name'] or self.inserting_queue in queue['name']
-                ]
+                relevant_queues = self._task_queues(all_queues)
 
                 if not relevant_queues:
                     self.logger.info("No relevant queues found. Stopping monitoring.")
@@ -491,22 +487,59 @@ class QueueTaskInitializer(BaseTaskInitializer):
             self.logger.error(f"Failed to fetch queues from RabbitMQ API: {e}")
             return []
 
+    def is_task_queue(self, queue_name):
+        """
+        Return True if ``queue_name`` belongs to this task: its computing and inserting
+        queues, and the per-model computing queues (``<computing_queue>_<model>``).
+        """
+        if queue_name in (self.computing_queue, self.inserting_queue):
+            return True
+        return queue_name.startswith(f"{self.computing_queue}_")
+
+    def _task_queues(self, queues):
+        """Filter queue dicts from the RabbitMQ API to this task's queues in the connection's vhost."""
+        params = getattr(self, 'connection_params', None)
+        vhost = params.virtual_host if params is not None else '/'
+        return [
+            q for q in queues
+            if self.is_task_queue(q['name']) and q.get('vhost', '/') == vhost
+        ]
+
+    def delete_task_queues(self):
+        """
+        Delete this task's queues (see :meth:`is_task_queue`) through the RabbitMQ HTTP API.
+
+        Used when ``delete_queues`` is enabled. Queues of other tasks, applications or
+        users on the same broker are left untouched.
+        """
+        queues = self._task_queues(self._get_all_queues_from_api())
+        if not queues:
+            self.logger.info("No queues of this task to delete.")
+            return
+        self._delete_queues(queues)
+
     def delete_all_queues(self):
         """
         Deletes all queues from the RabbitMQ server using the HTTP API.
+
+        This removes every queue on the broker, including those of other applications
+        and users. ``delete_queues`` uses :meth:`delete_task_queues` instead.
 
         Raises
         ------
         Exception
             If an error occurs during queue deletion.
         """
-        from requests.auth import HTTPBasicAuth
-
         # Obtener la lista de todas las colas
         queues = self._get_all_queues_from_api()
         if not queues:
             self.logger.info("No queues to delete.")
             return
+        self._delete_queues(queues)
+
+    def _delete_queues(self, queues):
+        """Delete the given queues (dicts from the RabbitMQ API) through the HTTP API."""
+        from requests.auth import HTTPBasicAuth
 
         rabbitmq_port_http = self.conf.get('rabbitmq_port_http', 15672)
         url_base = f"http://{self.conf['rabbitmq_host']}:{rabbitmq_port_http}/api/queues"

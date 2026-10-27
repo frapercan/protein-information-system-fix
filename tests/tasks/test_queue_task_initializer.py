@@ -313,3 +313,50 @@ def test_failure_counter_is_shared_with_worker_processes():
     for p in procs:
         p.join()
     assert task.failed_tasks.value == 3
+
+
+# ---------------------------------------------------------------------------
+# delete_queues
+# ---------------------------------------------------------------------------
+
+def test_delete_task_queues_only_deletes_own_queues(monkeypatch):
+    import protein_information_system.tasks.queue as queue_module
+
+    task = make_task()
+    own = [task.computing_queue, task.inserting_queue, f"{task.computing_queue}_ESM"]
+    others = ["othertask_computing", "someone_elses_queue", f"x{task.computing_queue}"]
+    api = [{"name": n, "vhost": "/"} for n in own + others]
+    api.append({"name": task.computing_queue, "vhost": "other_vhost"})
+    task._get_all_queues_from_api = lambda: api
+
+    deleted = []
+
+    class Response:
+        status_code = 204
+        text = ""
+
+    def fake_delete(url, auth):
+        deleted.append(url)
+        return Response()
+
+    monkeypatch.setattr(queue_module.requests, "delete", fake_delete)
+
+    task.delete_task_queues()
+
+    assert sorted(u.rsplit("/", 1)[1] for u in deleted) == sorted(own)
+    assert all("/%2F/" in u for u in deleted)
+
+
+def test_monitor_only_watches_own_queues():
+    task = make_task()
+    task.monitor_interval = 0
+    # Another task whose queue name contains ours as a substring keeps messages forever.
+    task._get_all_queues_from_api = lambda: [
+        {"name": task.computing_queue, "vhost": "/", "messages_ready": 0, "messages_unacknowledged": 0},
+        {"name": f"{task.computing_queue}_ESM", "vhost": "/", "messages_ready": 0, "messages_unacknowledged": 0},
+        {"name": f"my{task.computing_queue}", "vhost": "/", "messages_ready": 3, "messages_unacknowledged": 0},
+    ]
+
+    task.monitor_queues()  # returns once our own queues are empty
+
+    assert task.stop_event.is_set()

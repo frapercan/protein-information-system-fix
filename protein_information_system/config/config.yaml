@@ -49,7 +49,8 @@ rabbitmq_password: guest     # RabbitMQ password for authentication.
 # Maximum number of items to process (for debugging).
 limit_execution: 0 # False for complete run.
 
-# Reset queues with each execution.
+# Delete this task's queues (and pending messages) at startup. Only the task's own
+# queues are removed; other queues on the broker are left untouched.
 delete_queues: True
 
 # Raise TaskFailuresError at the end of a stage when tasks failed and were

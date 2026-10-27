@@ -15,6 +15,10 @@ from pika import PlainCredentials
 from protein_information_system.tasks.base import BaseTaskInitializer
 
 
+class TaskFailuresError(RuntimeError):
+    """Raised when tasks were discarded or worker processes crashed during the pipeline."""
+
+
 class QueueTaskInitializer(BaseTaskInitializer):
     """
     The QueueTaskInitializer class extends BaseTaskInitializer to manage tasks
@@ -28,6 +32,10 @@ class QueueTaskInitializer(BaseTaskInitializer):
         threads (list): A list of threading.Thread objects for auxiliary tasks like monitoring queues.
         stop_event (multiprocessing.Event): An event to signal workers and threads to stop.
         connection_params (pika.ConnectionParameters): Parameters for connecting to the RabbitMQ server.
+        failed_tasks (multiprocessing.Value): Number of tasks discarded after failing plus worker
+            processes that exited abnormally, shared with the worker processes.
+        skipped_tasks (multiprocessing.Value): Number of tasks skipped because ``process()``
+            raised ``ValueError``.
     """
 
     def __init__(self, conf, session_required=True):
@@ -47,6 +55,8 @@ class QueueTaskInitializer(BaseTaskInitializer):
         self.processes = []
         self.threads = []
         self.stop_event = multiprocessing.Event()
+        self.failed_tasks = multiprocessing.Value('i', 0)
+        self.skipped_tasks = multiprocessing.Value('i', 0)
         self.monitor_interval = conf.get('monitor_interval', 30)
         self.connection_params = pika.ConnectionParameters(
             host=self.conf['rabbitmq_host'],
@@ -122,8 +132,13 @@ class QueueTaskInitializer(BaseTaskInitializer):
             Exception: Any error from the pipeline. An error from the post-processing
                 hook is raised when the pipeline itself succeeded; if the pipeline
                 failed, it is logged and the pipeline error is raised instead.
+            TaskFailuresError: If ``fail_on_task_errors`` is true and tasks were discarded
+                or a worker process exited abnormally. Raised after post-processing, so
+                partial results are still written. When it is false (the default), the
+                failures are only logged.
         """
         self.logger.info("Starting the task processing pipeline.")
+        self._reset_counters()
         completed = False
         try:
             self.setup_rabbitmq()
@@ -147,7 +162,60 @@ class QueueTaskInitializer(BaseTaskInitializer):
                 # Only surface it when the pipeline itself succeeded; otherwise the
                 # original pipeline error is already propagating.
                 if completed:
+                    self._report_task_outcome(raise_on_failures=False)
                     raise
+
+        self._report_task_outcome()
+
+    @staticmethod
+    def _increment(counter):
+        """Increment a shared counter, if present (safe across worker processes)."""
+        if counter is not None:
+            with counter.get_lock():
+                counter.value += 1
+
+    def _reset_counters(self):
+        for name in ('failed_tasks', 'skipped_tasks'):
+            counter = getattr(self, name, None)
+            if counter is not None:
+                with counter.get_lock():
+                    counter.value = 0
+
+    def _record_task_failure(self):
+        """Count a task discarded after failing, or a worker that exited abnormally."""
+        self._increment(getattr(self, 'failed_tasks', None))
+
+    def _record_task_skip(self):
+        """Count a task skipped because ``process()`` raised ``ValueError``."""
+        self._increment(getattr(self, 'skipped_tasks', None))
+
+    def _check_worker_exit(self, process):
+        """Record a failure if a joined worker process exited abnormally (crash, OOM kill, signal)."""
+        if process.exitcode not in (0, None):
+            self.logger.error(
+                "Worker process %s exited with code %s; its in-flight work may be lost.",
+                process.name, process.exitcode
+            )
+            self._record_task_failure()
+
+    def _report_task_outcome(self, raise_on_failures=True):
+        """Log skipped tasks and failures; raise TaskFailuresError if configured to."""
+        skipped = getattr(self, 'skipped_tasks', None)
+        if skipped is not None and skipped.value:
+            self.logger.warning(
+                "%d task(s) were skipped because process() raised ValueError; see the warnings above.",
+                skipped.value
+            )
+        failed = getattr(self, 'failed_tasks', None)
+        if failed is None or not failed.value:
+            return
+        message = (
+            f"{failed.value} failure(s): tasks discarded after failing or worker processes "
+            "that exited abnormally; see the errors above."
+        )
+        if raise_on_failures and self.conf.get('fail_on_task_errors', False):
+            raise TaskFailuresError(message)
+        self.logger.error(message)
 
     def start_workers(self):
         """
@@ -180,6 +248,7 @@ class QueueTaskInitializer(BaseTaskInitializer):
             for proc in self.processes:
                 proc.join()
                 self.logger.info("A worker process has finished.")
+                self._check_worker_exit(proc)
         except Exception as e:
             self.logger.error(
                 f"Error during worker execution: {e}",
@@ -319,6 +388,7 @@ class QueueTaskInitializer(BaseTaskInitializer):
                 exc_info=True
             )
             ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+            self._record_task_failure()
 
     def callback(self, ch, method, properties, body):
         """
@@ -342,10 +412,13 @@ class QueueTaskInitializer(BaseTaskInitializer):
             ch.basic_ack(delivery_tag=method.delivery_tag)
             self.logger.debug("Message acknowledged.")
         except ValueError as e:
+            # ValueError from process() means "skip this task" (kept for backward
+            # compatibility). Skips are counted and reported at the end of start().
             self.logger.warning(
                 f"ValueError while processing message: {e}. Acknowledging without publishing."
             )
             ch.basic_ack(delivery_tag=method.delivery_tag)
+            self._record_task_skip()
         except Exception as e:
             # Retry once, after task_retry_delay seconds so that a brief outage of a
             # remote service can recover. A message that fails again is discarded:
@@ -359,6 +432,7 @@ class QueueTaskInitializer(BaseTaskInitializer):
                     exc_info=True
                 )
                 ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+                self._record_task_failure()
             else:
                 delay = float(self.conf.get('task_retry_delay', 5))
                 self.logger.error(

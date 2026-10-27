@@ -52,6 +52,12 @@ limit_execution: 0 # False for complete run.
 # Reset queues with each execution.
 delete_queues: True
 
+# Raise TaskFailuresError at the end of a stage when tasks failed and were
+# discarded, or a worker process crashed. Post-processing still runs first, so
+# partial results are written. With False (the default) the failures are only
+# logged and the next stage runs.
+fail_on_task_errors: False
+
 
 # ===================================
 # 📜 Information System Configuration

@@ -4,7 +4,7 @@ import multiprocessing
 
 import pytest
 
-from protein_information_system.tasks.queue import QueueTaskInitializer
+from protein_information_system.tasks.queue import QueueTaskInitializer, TaskFailuresError
 
 
 class DummyTask(QueueTaskInitializer):
@@ -25,6 +25,8 @@ def make_task(**conf):
                  "task_retry_delay": 0, **conf}
     task.logger = logging.getLogger("test_queue_task_initializer")
     task.stop_event = multiprocessing.Event()
+    task.failed_tasks = multiprocessing.Value("i", 0)
+    task.skipped_tasks = multiprocessing.Value("i", 0)
     task.processes = []
     task.threads = []
     task.setup_rabbitmq = lambda: None
@@ -187,3 +189,127 @@ def test_successful_message_is_published_and_acked():
 
     assert ch.acks == [1]
     assert ch.published[0][0] == task.inserting_queue
+
+
+# ---------------------------------------------------------------------------
+# Failed tasks
+# ---------------------------------------------------------------------------
+
+def _failing_store_entry(record):
+    raise RuntimeError("cannot store")
+
+
+def _workers_with_two_discarded_tasks(task):
+    import pickle
+
+    def workers():
+        ch = FakeChannel()
+        task.callback(ch, Method(redelivered=False), None, pickle.dumps(1))  # retried: not a failure
+        task.callback(ch, Method(redelivered=True), None, pickle.dumps(1))  # discarded
+        task.db_inserter_callback(ch, Method(), None, pickle.dumps(1))  # discarded
+
+    return workers
+
+
+def test_discarded_tasks_fail_the_pipeline_after_post_processing_when_enabled():
+    task = make_task(fail_on_task_errors=True)
+    calls = []
+    task.post_processing = lambda: calls.append("post")
+    task.process = _failing_process
+    task.store_entry = _failing_store_entry
+    task.start_workers = _workers_with_two_discarded_tasks(task)
+
+    with pytest.raises(TaskFailuresError, match="2 failure"):
+        task.start()
+    assert calls == ["post"]
+
+
+def test_discarded_tasks_are_only_logged_by_default(caplog):
+    task = make_task()
+    task.post_processing = lambda: None
+    task.process = _failing_process
+    task.store_entry = _failing_store_entry
+    task.start_workers = _workers_with_two_discarded_tasks(task)
+
+    with caplog.at_level(logging.ERROR):
+        task.start()
+    assert "2 failure(s)" in caplog.text
+
+
+def test_failure_count_is_logged_when_post_processing_fails(caplog):
+    task = make_task(fail_on_task_errors=True)
+    task.process = _failing_process
+    task.store_entry = _failing_store_entry
+    task.start_workers = _workers_with_two_discarded_tasks(task)
+
+    def failing_post_processing():
+        raise RuntimeError("summary failed")
+
+    task.post_processing = failing_post_processing
+
+    with caplog.at_level(logging.ERROR), pytest.raises(RuntimeError, match="summary failed"):
+        task.start()
+    assert "2 failure(s)" in caplog.text
+
+
+def test_counters_are_reset_on_each_start():
+    task = make_task(fail_on_task_errors=True)
+    task.post_processing = lambda: None
+    task.failed_tasks.value = 5
+    task.skipped_tasks.value = 5
+
+    task.start()  # no failures in this run
+
+    assert task.failed_tasks.value == 0
+    assert task.skipped_tasks.value == 0
+
+
+def test_value_error_in_process_is_counted_as_a_skip(caplog):
+    import pickle
+    task = make_task(fail_on_task_errors=True)
+    task.post_processing = lambda: None
+
+    def skip(target):
+        raise ValueError("nothing to do")
+
+    task.process = skip
+
+    def workers():
+        ch = FakeChannel()
+        task.callback(ch, Method(), None, pickle.dumps(1))
+        assert ch.acks == [1]
+
+    task.start_workers = workers
+
+    with caplog.at_level(logging.WARNING):
+        task.start()  # skips do not fail the pipeline
+    assert task.failed_tasks.value == 0
+    assert "1 task(s) were skipped" in caplog.text
+
+
+class _ExitedProcess:
+    def __init__(self, exitcode):
+        self.exitcode = exitcode
+        self.name = "Process-1"
+
+
+def test_crashed_worker_is_counted_as_a_failure():
+    task = make_task()
+    task._check_worker_exit(_ExitedProcess(-9))  # e.g. killed by the OOM killer
+    task._check_worker_exit(_ExitedProcess(0))
+    assert task.failed_tasks.value == 1
+
+
+def _increment_in_child(task):
+    task._record_task_failure()
+
+
+def test_failure_counter_is_shared_with_worker_processes():
+    ctx = multiprocessing.get_context("fork")  # make_task() holds lambdas, which spawn cannot pickle
+    task = make_task()
+    procs = [ctx.Process(target=_increment_in_child, args=(task,)) for _ in range(3)]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join()
+    assert task.failed_tasks.value == 3

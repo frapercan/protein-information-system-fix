@@ -2,7 +2,7 @@ name: Publish dry run (test only)
 
 # Same environment and commands as publish-pypy.yml (ubuntu-22.04, Python 3.10,
 # poetry 1.4.0, no lock file), without `poetry publish`. Runs this branch
-# (PR #54 + fixes) and CBBIO main side by side.
+# (PR #54 + fixes). Second round: poetry 2.2.1 instead of 1.4.0.
 on:
   push:
     branches: ["test/**"]
@@ -13,7 +13,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        source: [this-branch, cbbio-main]
+        source: [this-branch]
+        poetry: ["2.2.1"]
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     steps:
@@ -33,7 +34,7 @@ jobs:
           python-version: "3.10"
       - uses: abatilo/actions-poetry@v2
         with:
-          poetry-version: "1.4.0"
+          poetry-version: ${{ matrix.poetry }}
       - name: poetry install and build (as publish-pypy.yml)
         run: |
           grep -E '^version|dateutil' pyproject.toml

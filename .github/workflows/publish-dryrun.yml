@@ -1,0 +1,46 @@
+name: Publish dry run (test only)
+
+# Same environment and commands as publish-pypy.yml (ubuntu-22.04, Python 3.10,
+# poetry 1.4.0, no lock file), without `poetry publish`. Runs this branch
+# (PR #54 + fixes) and CBBIO main side by side.
+on:
+  push:
+    branches: ["test/**"]
+  workflow_dispatch:
+
+jobs:
+  dryrun:
+    strategy:
+      fail-fast: false
+      matrix:
+        source: [this-branch, cbbio-main]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - uses: actions/checkout@v4
+        if: matrix.source == 'this-branch'
+      - uses: actions/checkout@v4
+        if: matrix.source == 'cbbio-main'
+        with:
+          repository: CBBIO/protein-information-system
+          ref: main
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - uses: abatilo/actions-poetry@v2
+        with:
+          poetry-version: "1.4.0"
+      - name: poetry install and build (as publish-pypy.yml)
+        run: |
+          grep -E '^version|dateutil' pyproject.toml
+          time poetry install
+          poetry build
+          ls -la dist
+          poetry run python -c "import torch, torchvision, esm, protein_information_system.tasks.gpu; print('torch', torch.__version__, 'torchvision', torchvision.__version__)"
+      - name: Check the built package
+        run: |
+          pipx run twine check dist/*

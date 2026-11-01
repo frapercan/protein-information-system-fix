@@ -103,14 +103,18 @@ class GPUTaskInitializer(QueueTaskInitializer):
         try:
             credentials = PlainCredentials(self.conf['rabbitmq_user'], self.conf['rabbitmq_password'])
             self.connection = pika.BlockingConnection(
-                pika.ConnectionParameters(host=self.conf['rabbitmq_host'], credentials=credentials))
+                pika.ConnectionParameters(
+                    host=self.conf['rabbitmq_host'],
+                    port=self.conf.get('rabbitmq_port', 5672),
+                    credentials=credentials,
+                ))
             self.channel = self.connection.channel()
 
             # Declare queues for each embedding type
             for model in self.conf['embedding']['models']:
                 queue_name = f"{self.computing_queue}_{model}"
-                self.channel.queue_declare(queue=queue_name)
-            self.channel.queue_declare(queue=self.inserting_queue)
+                self.channel.queue_declare(queue=queue_name, durable=True)
+            self.channel.queue_declare(queue=self.inserting_queue, durable=True)
 
         except Exception:
             raise

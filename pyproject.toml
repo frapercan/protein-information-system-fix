@@ -26,6 +26,9 @@ sentencepiece = "^0.2.0"
 transformers = "^4.48.1"
 bio = "^1.8.0"
 esm = "^3.2.1"
+# botocore (esm -> boto3 -> botocore) requires python-dateutil <3; without this
+# bound poetry backtracks through every botocore release and never finishes.
+python-dateutil = ">=2.8.2,<3"
 
 
 

@@ -39,6 +39,15 @@ counted, can fail the run, and permanent errors no longer loop forever.
   they are now reported as failures.
 - Database connections use `client_encoding=utf8`, so clusters created under
   `LC_ALL=C` (`SQL_ASCII`) no longer fail on non-ASCII text.
+- `GPUTaskInitializer` ignored `rabbitmq_port` and always connected to port
+  5672, so on shared nodes it could reach another user's broker.
+- `GPUTaskInitializer` declared transient queues, which RabbitMQ 4.x rejects
+  (`transient_nonexcl_queues`); its queues are now durable, like the
+  CPU task queues. A broker that still holds transient queues from an older
+  run rejects the new declaration until they are removed: keep
+  `delete_queues: True` (the default in FANTASIA) or restart the broker once.
+- `python-dateutil` is bounded below 3, as botocore requires; with 3.0.0 on
+  PyPI, `poetry install` no longer finished resolving dependencies.
 
 ### Known limitations
 - `Structure3DiManager.store_entry()` still catches and logs per-record errors,
